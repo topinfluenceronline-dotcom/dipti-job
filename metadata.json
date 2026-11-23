@@ -1,0 +1,6 @@
+{
+  "name": "Dipti Job Radar — Dubai Hospitality & F&B Alerts",
+  "description": "Real-time Dubai food & beverage and luxury hotel hospitality job scout with recruiter contact extraction and instant email alerts for Dipti Basu Mondal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
