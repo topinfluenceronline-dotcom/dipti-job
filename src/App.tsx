@@ -10,6 +10,7 @@ import type {
   RadarState,
 } from './types/jobs.ts';
 import { getAccessToken, googleSignIn, initAuth, logout } from './lib/firebaseAuth.ts';
+import { ApiRequestError, fetchApiJson } from './lib/api.ts';
 import { playConciergeChime, triggerDesktopNotification } from './lib/soundAlert.ts';
 import { TopBar, type ActiveTab } from './components/TopBar.tsx';
 import { QuickFetchBar } from './components/QuickFetchBar.tsx';
@@ -124,38 +125,46 @@ export default function App() {
     return () => unsub();
   }, []);
 
-  // Load initial radar state
+  const syncStateFromServer = useCallback(async (retries = 5) => {
+    const data = await fetchApiJson<RadarState & { isScanning?: boolean }>('/api/state', {
+      retries,
+      retryDelayMs: 900,
+    });
+    setRadar({
+      jobs: data.jobs ?? [],
+      settings: data.settings ?? DEFAULT_RADAR_STATE.settings,
+      emailLog: data.emailLog ?? [],
+      notifications: data.notifications ?? [],
+      lastScanAt: data.lastScanAt ?? null,
+      lastScanSummary: data.lastScanSummary ?? null,
+      scanCount: data.scanCount ?? 0,
+      smtpConfigured: Boolean(data.smtpConfigured),
+      geminiConfigured: Boolean(data.geminiConfigured),
+    });
+    setIsScanning(Boolean(data.isScanning));
+    if (data.jobs?.length > 0) {
+      setSelectedJobId((prev) => prev ?? data.jobs[0].id);
+    }
+    setNotice((prev) => (prev?.type === 'error' ? null : prev));
+  }, []);
+
+  // Load initial radar state with automatic cold-start retry
   useEffect(() => {
     let mounted = true;
-    fetch('/api/state')
-      .then((res) => res.json())
-      .then((data: RadarState & { isScanning?: boolean }) => {
-        if (!mounted) return;
-        setRadar({
-          jobs: data.jobs ?? [],
-          settings: data.settings ?? DEFAULT_RADAR_STATE.settings,
-          emailLog: data.emailLog ?? [],
-          notifications: data.notifications ?? [],
-          lastScanAt: data.lastScanAt ?? null,
-          lastScanSummary: data.lastScanSummary ?? null,
-          scanCount: data.scanCount ?? 0,
-          smtpConfigured: Boolean(data.smtpConfigured),
-          geminiConfigured: Boolean(data.geminiConfigured),
-        });
-        setIsScanning(Boolean(data.isScanning));
-        if (data.jobs?.length > 0) {
-          setSelectedJobId(data.jobs[0].id);
-        }
-      })
-      .catch(() => {
-        if (mounted) {
-          showNotice('error', 'Could not reach the Job Radar server.');
-        }
-      });
+    syncStateFromServer(5).catch((err) => {
+      if (mounted) {
+        showNotice(
+          'error',
+          err instanceof Error
+            ? err.message
+            : 'Job Radar server is still starting up. Click Scan Dubai Jobs in a few seconds.'
+        );
+      }
+    });
     return () => {
       mounted = false;
     };
-  }, [showNotice]);
+  }, [showNotice, syncStateFromServer]);
 
   // Connect to SSE real-time push stream
   useEffect(() => {
@@ -171,6 +180,8 @@ export default function App() {
       } catch {
         // ignore
       }
+      // Refresh state automatically when stream reconnects
+      syncStateFromServer(2).catch(() => {});
     });
 
     source.addEventListener('scan-started', () => {
@@ -261,26 +272,29 @@ export default function App() {
       source.close();
       setStreamConnected(false);
     };
-  }, [showNotice]);
+  }, [showNotice, syncStateFromServer]);
 
   const handleScan = useCallback(
     async (platformFocus: PlatformSource | 'All' = selectedPlatform, customQuery = '') => {
       setIsScanning(true);
       setNotice(null);
       try {
-        const res = await fetch('/api/jobs/scan', {
+        const data = await fetchApiJson<{
+          discoveredCount?: number;
+          addedCount?: number;
+          notificationsCreated?: number;
+          state?: RadarState;
+        }>('/api/jobs/scan', {
           method: 'POST',
           headers: authHeaders(),
           body: JSON.stringify({ platformFocus, customQuery }),
+          retries: 2,
+          retryDelayMs: 1000,
         });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || 'Scan failed.');
-        }
         if (data.state) {
           setRadar(data.state);
           if (data.state.jobs.length > 0) {
-            setSelectedJobId((prev) => prev ?? data.state.jobs[0].id);
+            setSelectedJobId((prev) => prev ?? data.state!.jobs[0].id);
           }
         }
         const added = data.addedCount ?? 0;
@@ -297,6 +311,10 @@ export default function App() {
           );
         }
       } catch (err) {
+        if (err instanceof ApiRequestError && err.status === 409) {
+          showNotice('info', 'A live scan is already running — results will appear automatically.');
+          return;
+        }
         showNotice('error', err instanceof Error ? err.message : 'Unable to scan Dubai jobs.');
       } finally {
         setIsScanning(false);
@@ -309,15 +327,15 @@ export default function App() {
     async (input: string) => {
       setIsInspecting(true);
       try {
-        const res = await fetch('/api/jobs/inspect', {
+        const data = await fetchApiJson<{
+          job: JobListing;
+          state?: RadarState;
+        }>('/api/jobs/inspect', {
           method: 'POST',
           headers: authHeaders(),
           body: JSON.stringify({ input }),
+          retries: 1,
         });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || 'Could not extract job details.');
-        }
         if (data.state) {
           setRadar(data.state);
         }
@@ -333,23 +351,29 @@ export default function App() {
   );
 
   const handleToggleApplied = async (id: string, applied: boolean) => {
-    const res = await fetch(`/api/jobs/${encodeURIComponent(id)}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ applied }),
-    });
-    if (res.ok) {
-      const { job } = await res.json();
+    try {
+      const { job } = await fetchApiJson<{ job: JobListing }>(
+        `/api/jobs/${encodeURIComponent(id)}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ applied }),
+        }
+      );
       setRadar((prev) => ({
         ...prev,
         jobs: prev.jobs.map((j) => (j.id === id ? job : j)),
       }));
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Failed to update job status.');
     }
   };
 
   const handleDeleteJob = async (id: string) => {
-    const res = await fetch(`/api/jobs/${encodeURIComponent(id)}`, { method: 'DELETE' });
-    if (res.ok) {
+    try {
+      await fetchApiJson<{ ok: boolean }>(`/api/jobs/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
       setRadar((prev) => {
         const remaining = prev.jobs.filter((j) => j.id !== id);
         if (selectedJobId === id) {
@@ -357,35 +381,32 @@ export default function App() {
         }
         return { ...prev, jobs: remaining };
       });
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Failed to dismiss listing.');
     }
   };
 
   const handleGenerateDraft = async (id: string) => {
-    const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/draft`, {
+    const data = await fetchApiJson<{
+      draft: { subject: string; body: string; whatsappMessage: string };
+      job: JobListing;
+    }>(`/api/jobs/${encodeURIComponent(id)}/draft`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Failed to generate pitch.');
-    }
     setRadar((prev) => ({
       ...prev,
       jobs: prev.jobs.map((j) => (j.id === id ? data.job : j)),
     }));
-    return data.draft as { subject: string; body: string; whatsappMessage: string };
+    return data.draft;
   };
 
   const handleSaveSettings = async (next: AlertSettings) => {
-    const res = await fetch('/api/settings', {
+    const data = await fetchApiJson<{ settings: AlertSettings }>('/api/settings', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(next),
     });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Failed to save settings.');
-    }
     setRadar((prev) => ({ ...prev, settings: data.settings }));
   };
 
@@ -495,7 +516,10 @@ export default function App() {
     if (!pendingEmail) return;
     setSendingEmail(true);
     try {
-      const res = await fetch('/api/alerts/send', {
+      const data = await fetchApiJson<{
+        record?: EmailAlertRecord;
+        state?: RadarState;
+      }>('/api/alerts/send', {
         method: 'POST',
         headers: authHeaders(),
         body: JSON.stringify({
@@ -505,11 +529,8 @@ export default function App() {
           body: pendingEmail.body,
           kind: pendingEmail.kind,
         }),
+        retries: 1,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to dispatch email.');
-      }
       if (data.state) {
         setRadar(data.state);
       }

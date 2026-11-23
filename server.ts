@@ -100,7 +100,7 @@ async function processDiscoveredJobs(
 
         emailDelivered = record.status === 'delivered';
         job.alertStatus = emailDelivered ? 'sent' : record.status === 'ready' ? 'queued' : 'pending';
-        state.emailLog = [record, ...state.emailLog].slice(0, 120);
+        state.emailLog = [record, ...state.emailLog].slice(0, 50);
         alertsTriggered += 1;
 
         broadcastSse('alert-dispatched', { record, jobId: job.id });
@@ -245,6 +245,11 @@ app.get('/api/stream', (req, res) => {
     clearInterval(heartbeat);
     sseClients.delete(res);
   });
+});
+
+// Health check
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, isScanning, jobsCount: state.jobs.length });
 });
 
 // Get full radar state
@@ -491,7 +496,7 @@ app.post('/api/alerts/send', async (req, res) => {
       gmailAccessToken,
     });
 
-    state.emailLog = [record, ...state.emailLog].slice(0, 120);
+    state.emailLog = [record, ...state.emailLog].slice(0, 50);
     if (kind === 'job-alert' && record.status === 'delivered') {
       job.alertStatus = 'sent';
     } else if (kind === 'recruiter-outreach' && record.status === 'delivered') {
@@ -506,13 +511,26 @@ app.post('/api/alerts/send', async (req, res) => {
   }
 });
 
+// Never allow unknown /api/* requests to fall through to HTML/text
+app.all('/api/*', (_req, res) => {
+  res.status(404).json({ error: 'API endpoint not found.' });
+});
+
 async function startServer(): Promise<void> {
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
+    const vitePromise = createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
-    app.use(vite.middlewares);
+    app.use(async (req, res, next) => {
+      if (req.path.startsWith('/api/')) return next();
+      try {
+        const vite = await vitePromise;
+        vite.middlewares(req, res, next);
+      } catch (err) {
+        next(err);
+      }
+    });
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     if (fs.existsSync(distDir)) {
